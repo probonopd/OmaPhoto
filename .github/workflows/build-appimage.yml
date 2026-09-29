@@ -83,22 +83,9 @@ jobs:
           mv squashfs-root squashfs-root-linuxdeploy-qt
           export PATH="${PWD}/squashfs-root-linuxdeploy-qt/usr/bin:${PATH}"
 
-          # This AppImage is meant to be self-standing: any library the app needs must be
-          # bundled inside it, not assumed present on the target. linuxdeploy's own
-          # auto-discovery deliberately excludes "always assume this is on the host" system
-          # libraries (X11, GLX/EGL, xcb) on the theory that any Linux desktop already has
-          # them - which held for AppRun launched from Ubuntu-based CI, but not for a stock
-          # minimal container. Explicitly bundle each one via --library so the AppImage
-          # carries its own copy instead of depending on the target providing it; resolve
-          # each soname's real path with ldconfig rather than hardcoding a directory, since
-          # that varies (lib vs lib/x86_64-linux-gnu).
-          # libGL.so.1 (GLVND's dispatcher) itself needs libGLX.so.0, libGLdispatch.so.0,
-          # and libOpenGL.so.0 as separate vendor/support libraries at runtime - Debian's
-          # test container happened to already have system copies of these (from some
-          # other package's dependency chain), which silently masked them being missing
-          # from the bundle; Alpine's minimal container has no such incidental copies, and
-          # each one that isn't bundled here surfaces as its own "error while loading
-          # shared libraries" only once the previous one is fixed - discovered one at a time.
+          # Bundle the libraries linuxdeploy assumes the host already has (X11, GL/EGL,
+          # GLVND's libGL/libGLX/libGLdispatch/libOpenGL split), so the AppImage is
+          # self-contained. Each soname is resolved via ldconfig rather than a hardcoded path.
           RUNTIME_LIBS="libX11.so.6 libxcb.so.1 libxkbcommon.so.0 libxkbcommon-x11.so.0 \
             libSM.so.6 libICE.so.6 libGL.so.1 libGLX.so.0 libGLdispatch.so.0 libEGL.so.1 libOpenGL.so.0 \
             libxcb-icccm.so.4 libxcb-image.so.0 libxcb-keysyms.so.1 \
@@ -146,30 +133,16 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: debian:trixie-slim
-      # Docker's default seccomp profile blocks ptrace; needed for the gdb backtrace
-      # this job takes of a stalled AppRun before killing it.
+      # For the gdb backtrace below; Docker's default seccomp profile blocks ptrace.
       options: --cap-add=SYS_PTRACE
     steps:
-      # AppImage's actual portability promise is about glibc distros - this is the real
-      # gate (see the `upload` job below). An earlier attempt at doing this on Alpine
-      # (musl) instead hit a hard wall before the AppImage bundled its own libraries:
-      # with a real-glibc compat layer forced in for the payload, the process also had
-      # to load Alpine's musl-native xcb/mesa libraries and hung indefinitely. Now that
-      # everything the app needs is bundled (see the build job), a second, separate
-      # `screenshot-alpine` job below tries Alpine again as a stricter, optional
-      # stretch-goal test - no compat layer needed at all here on Debian either way.
       - name: Download AppImage artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: appimage-x86_64
 
-      # This is meant to be a stock minimal system with nothing app-specific
-      # preinstalled - that's the whole point of the test. Every library the app itself
-      # needs (X11, xcb, GL/EGL, etc.) is bundled into the AppImage in the build job
-      # instead; only genuine test infrastructure (a display, a screenshot tool, a font
-      # to render, TLS roots for the earlier download) belongs here. If this job ever
-      # needs an app library added back to make AppRun start, that means the build job's
-      # bundling is incomplete - fix it there, not here.
+      # Nothing app-specific belongs here - every library the app needs is bundled
+      # in the build job. Only test infrastructure (display, screenshot tooling).
       - name: Install test infrastructure (display, screenshot tooling - no app libraries)
         run: |
           apt-get update
@@ -187,60 +160,27 @@ jobs:
           sleep 2
 
           export DISPLAY=:99
-          # The last run got a real window into xwininfo's tree (1180x780, not hung) but
-          # its framebuffer stayed completely flat for the full retry window - the window
-          # was created but never painted. AppImage's own catalog-testing project runs a
-          # window manager for exactly this reason ("getting the active window seems to
-          # require a window manager"): without one to map the window and answer the
-          # ICCCM/EWMH handshake around it, some toolkits never get the Expose event that
-          # triggers the first paint.
+          # A window manager is required for the window to actually get mapped and painted.
           icewm > /dev/null 2>&1 &
           ICEWM_PID=$!
           sleep 2
           export QT_QPA_PLATFORM=xcb
-          # No D-Bus/AT-SPI daemon in this container - Qt's accessibility bridge would
-          # otherwise block trying to reach it instead of failing fast.
+          # No AT-SPI/D-Bus/GPU in this container; disable the bits that would otherwise
+          # hang or stall trying to reach them instead of failing fast.
           export QT_ACCESSIBILITY=0
-          # The previous run's gdb backtrace showed a QDBusConnection worker thread
-          # already spawned and blocked, with xwininfo showing zero windows ever created -
-          # the app never got as far as the main window. This container has no dbus-daemon
-          # at all, but DISPLAY is set, which is exactly the condition that makes libdbus
-          # attempt its X11-property-based session-bus autolaunch handshake instead of
-          # failing immediately - and that handshake has nothing to actually talk to here.
-          # "disabled:" is libdbus's own sentinel for "no bus, do not try to autolaunch one".
           export DBUS_SESSION_BUS_ADDRESS=disabled:
-          # Xvfb has no real GPU and no DRI driver files are bundled in the AppImage, so
-          # Qt's xcb platform plugin probing GLX/EGL for a window surface format (which it
-          # does at startup even for a plain Widgets app with no OpenGL widgets) can stall
-          # instead of failing cleanly. Skip that probing entirely rather than chase down
-          # driver files to bundle for a code path the app doesn't actually need.
           export QT_XCB_GL_INTEGRATION=none
           export LIBGL_ALWAYS_SOFTWARE=1
-          # Neither this env var check nor QT_DEBUG_PLUGINS fixes anything by themselves -
-          # they only make the next failure's log more informative than "nothing happened".
           mkdir -p -m0700 /tmp/runtime-root
           export XDG_RUNTIME_DIR=/tmp/runtime-root
           export QT_DEBUG_PLUGINS=1
           ./squashfs-root/AppRun &
           APP_PID=$!
 
-          # A single fixed sleep-then-grab could catch the window before it has painted
-          # anything, passing `test -s` on a screenshot that is really just a blank/solid
-          # frame. Instead poll for up to 15s, re-grabbing every ~2s, and stop as soon as a
-          # frame's pixel stddev shows it is not flat - i.e. something was actually drawn.
-          #
-          # `%[fx:image.stdDev]` is not a real ImageMagick property (the correct one is
-          # `%[fx:standard_deviation]`), and the old check swallowed identify's stderr and
-          # silently fell back to "0" on any error - meaning every prior "still blank"
-          # verdict from this job may have been this check failing, not the app. Use the
-          # real property name and print (not swallow) identify's own error if it has one,
-          # so a tool failure is visible instead of indistinguishable from a real blank frame.
-          #
-          # A non-flat screenshot alone is not proof the app rendered: icewm's own taskbar
-          # and desktop chrome are non-flat by themselves, so a run where AppRun crashed
-          # immediately (e.g. a missing bundled library) can still "pass" on pixel stddev
-          # with nothing but the window manager's own furniture on screen. Require an actual
-          # window owned by the app (matched on its WM_CLASS, "OmaPhoto") to exist first.
+          # Poll for up to 15s for an actual window owned by the app (matched by
+          # WM_CLASS), then check its content isn't flat - a window manager's own
+          # desktop chrome is non-flat by itself, so a bare pixel check alone could
+          # pass even if the app crashed on startup.
           START=$(date +%s)
           STDDEV=0
           WINDOW_FOUND=0
@@ -252,10 +192,6 @@ jobs:
               echo "OmaPhoto window not found yet" >&2
               continue
             fi
-            # GitHub Actions runs this under `bash -e`, so a plain `VAR=$(cmd)` assignment
-            # would abort the whole step the instant ffmpeg or identify ever failed,
-            # skipping the diagnostics and cleanup below - guard both explicitly instead
-            # of relying on the fallback logic ever actually being reached.
             ffmpeg -y -f x11grab -video_size 1280x800 -i "$DISPLAY" -frames:v 1 screenshot.png -loglevel error || {
               echo "ffmpeg capture failed, retrying" >&2; continue; }
             if IDENTIFY_OUT=$(identify -format "%[fx:standard_deviation]" screenshot.png 2>&1); then
@@ -270,11 +206,7 @@ jobs:
             fi
           done
 
-          # Distinguish "still running but never painted" (a real rendering problem) from
-          # "already exited" (a crash or early return) before killing it - both look
-          # identical from the screenshot alone, but need different follow-up. If it's
-          # still running, grab a backtrace of every thread before killing it - a fixed
-          # env var is a guess, a backtrace of where it actually is is not.
+          # If it's still running but never rendered, capture a backtrace before killing it.
           echo "xwininfo window list:" >&2
           timeout 10 xwininfo -tree -root >&2 2>&1 || true
           if kill -0 "$APP_PID" 2>/dev/null; then
@@ -313,12 +245,10 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: alpine:3.20
-      # Docker's default seccomp profile blocks ptrace; needed for the gdb backtrace
-      # this job takes of a stalled AppRun before killing it.
       options: --cap-add=SYS_PTRACE
     steps:
-      # actions/* run via a Node binary the runner injects from the host, which is
-      # glibc-linked; without a compat shim it can't even exec inside a musl container.
+      # actions/* run via a glibc Node binary the runner injects from the host, which
+      # can't exec inside a musl container without this.
       - name: Install glibc compat for the injected actions runtime
         run: apk add --no-cache libc6-compat
 
@@ -327,16 +257,9 @@ jobs:
         with:
           name: appimage-x86_64
 
-      # The AppImage's payload is glibc-linked (built on Ubuntu) and now bundles every
-      # library it needs (X11, xcb, GL/EGL, etc. - see the build job), so unlike the
-      # earlier Alpine attempt, it should no longer touch any of Alpine's own musl-native
-      # system libraries at runtime - the exact thing that caused the earlier indefinite
-      # hang. It still needs a working glibc dynamic linker just to start at all, though:
-      # gcompat (Alpine's official shim) lacks GLIBC_2.38-era symbols this payload needs
-      # (__isoc23_strtol, renameat2, close_range, pthread_cond_clockwait), and
-      # sgerrand/alpine-pkg-glibc stops at glibc 2.35 - dalet-oss/alpine-glibc continues
-      # that same packaging up to date. This is a third-party apk repo and signing key,
-      # not an official Alpine package.
+      # gcompat (Alpine's official shim) is missing GLIBC_2.38-era symbols this
+      # payload needs, so use a real, up to date glibc build instead - a third-party
+      # apk repo and signing key, not an official Alpine package.
       - name: Install a real glibc (gcompat is not complete enough for this payload)
         run: |
           GLIBC_VER=2.44
@@ -347,9 +270,6 @@ jobs:
           apk add --no-cache --force-overwrite "glibc-${GLIBC_VER}.apk" "glibc-bin-${GLIBC_VER}.apk"
           rm -f "glibc-${GLIBC_VER}.apk" "glibc-bin-${GLIBC_VER}.apk"
 
-      # Same rule as the Debian job: this container should need nothing app-specific,
-      # only genuine test infrastructure. If AppRun ever needs an app library added here,
-      # the build job's bundling is incomplete - fix it there, not here.
       - name: Install test infrastructure (display, screenshot tooling - no app libraries)
         run: |
           apk add --no-cache \
@@ -366,8 +286,6 @@ jobs:
           sleep 2
 
           export DISPLAY=:99
-          # See the Debian job for why a window manager, DBUS_SESSION_BUS_ADDRESS=disabled:,
-          # and QT_ACCESSIBILITY=0 are all here - same reasoning, same container-vs-desktop gaps.
           icewm > /dev/null 2>&1 &
           ICEWM_PID=$!
           sleep 2
@@ -382,14 +300,7 @@ jobs:
           ./squashfs-root/AppRun &
           APP_PID=$!
 
-          # Same retry-until-real-content check as the Debian job, using the correct
-          # ImageMagick property (see that job's comment for the bug this replaced) and
-          # requiring an actual OmaPhoto-owned window first - a run where AppRun crashed
-          # immediately (e.g. a missing bundled library) can otherwise still "pass" on
-          # pixel stddev alone, since icewm's own taskbar and desktop chrome are non-flat
-          # by themselves. This exact false pass happened here once already: AppRun failed
-          # with "error while loading shared libraries: libGLX.so.0: ..." and the stddev
-          # check still measured 0.14 from icewm's desktop and reported success.
+          # Same window + content check as the Debian job.
           START=$(date +%s)
           STDDEV=0
           WINDOW_FOUND=0
@@ -401,7 +312,6 @@ jobs:
               echo "OmaPhoto window not found yet" >&2
               continue
             fi
-            # Same errexit guard as the Debian job - see its comment for why.
             ffmpeg -y -f x11grab -video_size 1280x800 -i "$DISPLAY" -frames:v 1 screenshot-alpine.png -loglevel error || {
               echo "ffmpeg capture failed, retrying" >&2; continue; }
             if IDENTIFY_OUT=$(identify -format "%[fx:standard_deviation]" screenshot-alpine.png 2>&1); then
@@ -450,9 +360,8 @@ jobs:
   upload:
     name: Create release
     needs: [build, screenshot-debian, screenshot-alpine]
-    # Debian is the real gate (AppImage's actual portability promise); Alpine is a
-    # stricter, more fragile stretch goal - its screenshot gets included when it
-    # succeeds, but a release still ships without it if it fails.
+    # Debian gates the release; Alpine is optional (its screenshot is included when
+    # it succeeds, but a release still ships without it if it fails).
     if: |
       always() && github.event_name == 'push' &&
       needs.build.result == 'success' && needs.screenshot-debian.result == 'success'
@@ -477,7 +386,6 @@ jobs:
           chmod +x pyuploadtool-x86_64.AppImage
           FILES="screenshot/screenshot.png"
           [ -f screenshot-alpine/screenshot-alpine.png ] && FILES="$FILES screenshot-alpine/screenshot-alpine.png"
-          # A rolling build should never show as the repo's "Latest" stable release.
           GITHUB_RELEASE_NAME="$VERSION" GITHUB_CONTINUOUS_RELEASE_TYPE=prerelease \
             ./pyuploadtool-x86_64.AppImage **/OmaPhoto*.AppImage* $FILES
 
@@ -485,9 +393,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Derive the tag from the actual event instead of trusting "most recently
-          # created release" ordering, which a concurrent run or another release
-          # stream could make point at the wrong release.
           case "$GITHUB_REF" in
             refs/tags/*) TAG="${GITHUB_REF#refs/tags/}" ;;
             *) TAG="continuous" ;;
