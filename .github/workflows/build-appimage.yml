@@ -28,9 +28,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake ninja-build qt6-base-dev qt6-base-dev-tools libgl1-mesa-dev qt6-wayland \
+            g++ cmake ninja-build qt6-base-dev qt6-base-dev-tools qt6-svg-dev libgl1-mesa-dev qt6-wayland \
             fonts-dejavu-core qt6-image-formats-plugins libheif-dev libheif-plugin-libde265 \
-            libfontconfig-dev ca-certificates curl dpkg-dev file fakeroot \
+            libfontconfig-dev libraw-dev pkgconf ca-certificates curl dpkg-dev file fakeroot \
             patchelf desktop-file-utils \
             libx11-6 libxcb1 libxkbcommon0 libxkbcommon-x11-0 libsm6 libice6 \
             libgl1 libegl1 libopengl0 \
